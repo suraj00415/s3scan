@@ -114,12 +114,20 @@ function probeBucketHttp(bucketName, timeout) {
 
 // ─── Anonymous Listing Probe ────────────────────────────────────────────────
 
-function probeListAnonymous(bucketName, timeout) {
+function probeListAnonymous(bucketName, timeout, redirectRegion) {
   return new Promise((resolve) => {
-    const baseUrl = hasDots(bucketName)
-      ? `https://s3.amazonaws.com/${bucketName}?list-type=2&max-keys=20`
-      : `https://${bucketName}.s3.amazonaws.com/?list-type=2&max-keys=20`;
-    const url = baseUrl;
+    let url;
+    if (redirectRegion) {
+      if (hasDots(bucketName)) {
+        url = `https://s3.${redirectRegion}.amazonaws.com/${bucketName}?list-type=2&max-keys=20`;
+      } else {
+        url = `https://${bucketName}.s3.${redirectRegion}.amazonaws.com/?list-type=2&max-keys=20`;
+      }
+    } else if (hasDots(bucketName)) {
+      url = `https://s3.amazonaws.com/${bucketName}?list-type=2&max-keys=20`;
+    } else {
+      url = `https://${bucketName}.s3.amazonaws.com/?list-type=2&max-keys=20`;
+    }
     const req = https.get(url, { timeout, ...TLS_OPTIONS }, (res) => {
       let body = "";
       res.on("data", (chunk) => (body += chunk));
@@ -155,15 +163,19 @@ function probeListAnonymous(bucketName, timeout) {
 
 // ─── Authenticated Listing Probe (AWS SDK) ──────────────────────────────────
 
-async function probeListAuthenticated(s3Client, bucketName) {
+async function probeListAuthenticated(s3Client, bucketName, redirectRegion) {
   if (!s3Client) return { bucket: bucketName, listable: false, objects: [], error: "no-credentials" };
+
+  const clientToUse = redirectRegion
+    ? new S3Client({ region: redirectRegion, credentials: s3Client.config.credentials })
+    : s3Client;
 
   try {
     const cmd = new ListObjectsV2Command({
       Bucket: bucketName,
       MaxKeys: 20,
     });
-    const response = await s3Client.send(cmd);
+    const response = await clientToUse.send(cmd);
     const objects = (response.Contents || []).map((obj) => obj.Key);
     return {
       bucket: bucketName,
@@ -173,6 +185,12 @@ async function probeListAuthenticated(s3Client, bucketName) {
     };
   } catch (err) {
     const code = err.name || err.Code || "";
+    if (code === "PermanentRedirect" && !redirectRegion && err.$response) {
+      const region = err.$response.headers && err.$response.headers["x-amz-bucket-region"];
+      if (region) {
+        return probeListAuthenticated(s3Client, bucketName, region);
+      }
+    }
     return {
       bucket: bucketName,
       listable: false,
@@ -600,44 +618,50 @@ async function scan(buckets, opts) {
         continue;
       }
 
+      // For 301 redirects, extract the correct region from response
+      let redirectRegion = null;
+      if (existence.statusCode === 301) {
+        // Try x-amz-bucket-region header first
+        if (existence.headers && existence.headers["x-amz-bucket-region"]) {
+          redirectRegion = existence.headers["x-amz-bucket-region"];
+        }
+        // Try extracting region from Endpoint in body
+        if (!redirectRegion && existence.body) {
+          const endpointMatch = existence.body.match(/<Endpoint>([^<]+)<\/Endpoint>/);
+          if (endpointMatch) {
+            const regionMatch = endpointMatch[1].match(/s3[.-]([a-z0-9-]+)\.amazonaws\.com/);
+            if (regionMatch) redirectRegion = regionMatch[1];
+          }
+        }
+        // Try Location header
+        if (!redirectRegion && existence.headers && existence.headers.location) {
+          const locMatch = existence.headers.location.match(/s3[.-]([a-z0-9-]+)\.amazonaws\.com/);
+          if (locMatch) redirectRegion = locMatch[1];
+        }
+      }
+
       // Phase 2: Anonymous listing
       if (!opts.skipAnon) {
-        // If Phase 1 already returned a ListBucketResult, bucket is publicly listable
-        if (existence.statusCode === 200 && existence.body && existence.body.includes("<ListBucketResult")) {
-          const objects = [];
-          const keyRegex = /<Key>([^<]+)<\/Key>/g;
-          let match;
-          while ((match = keyRegex.exec(existence.body)) !== null) {
-            objects.push(match[1]);
-          }
-          result.anonymousListing = {
-            listable: true,
-            statusCode: 200,
-            objects,
-            objectCount: objects.length,
-          };
-        } else {
-          await rateLimiter.acquire();
-          const anonResult = await withRetry(
-            () => probeListAnonymous(bucketName, opts.timeout),
-            opts.retries,
-            rateLimiter
-          );
-          result.anonymousListing = {
-            listable: anonResult.listable,
-            statusCode: anonResult.statusCode,
-          };
-          if (anonResult.listable) {
-            result.anonymousListing.objects = anonResult.objects;
-            result.anonymousListing.objectCount = anonResult.objects.length;
-          }
+        await rateLimiter.acquire();
+        const anonResult = await withRetry(
+          () => probeListAnonymous(bucketName, opts.timeout, redirectRegion),
+          opts.retries,
+          rateLimiter
+        );
+        result.anonymousListing = {
+          listable: anonResult.listable,
+          statusCode: anonResult.statusCode,
+        };
+        if (anonResult.listable) {
+          result.anonymousListing.objects = anonResult.objects;
+          result.anonymousListing.objectCount = anonResult.objects.length;
         }
       }
 
       // Phase 3: Authenticated listing
       if (!opts.skipAuth && s3Client) {
         await rateLimiter.acquire();
-        const authResult = await probeListAuthenticated(s3Client, bucketName);
+        const authResult = await probeListAuthenticated(s3Client, bucketName, redirectRegion);
         result.authenticatedListing = {
           listable: authResult.listable,
         };
