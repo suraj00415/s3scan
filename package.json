@@ -1,0 +1,17 @@
+{
+  "name": "s3scan",
+  "version": "1.0.0",
+  "description": "S3 Bucket Scanner - probes buckets for existence and directory listing (anonymous + authenticated)",
+  "main": "s3scan.js",
+  "bin": {
+    "s3scan": "./s3scan.js"
+  },
+  "scripts": {
+    "start": "node s3scan.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.650.0"
+  },
+  "keywords": ["s3", "bucket", "scanner", "security", "recon", "enumeration"],
+  "license": "MIT"
+}
